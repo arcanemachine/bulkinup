@@ -105,11 +105,10 @@ YourProject.Repo.bulk_upsert(YourProject.Persons.Person, attrs_list)
 
 See `Bulkinup.__using__/1` for the defaults and precedence rules.
 
-## Invalid rows are skipped, visibly
+## Invalid rows are skipped
 
-Rows whose changesets are invalid are skipped rather than written. The counts in the return
-value make this visible, and each call that skips rows emits one `:warning` log summarizing
-them (with per-row detail at the `:debug` level):
+Rows whose changesets are invalid are skipped rather than written. The `:skipped` count in the
+return value shows how many:
 
 ```text
 iex> Bulkinup.insert(
@@ -119,6 +118,22 @@ iex> Bulkinup.insert(
 ...> )
 {:ok, %{inserted: 1, skipped: 1}}
 ```
+
+Bulkinup does not log. To log or report the skipped rows, pass an `:on_skipped` handler, which
+receives their changesets:
+
+```elixir
+require Logger
+
+Bulkinup.insert(YourProject.Repo, YourProject.Persons.Person, attrs_list,
+  on_skipped: fn %{changesets: changesets} ->
+    Logger.warning("Skipped #{length(changesets)} invalid rows")
+  end
+)
+```
+
+See the Handlers section of `Bulkinup.upsert/4` for details, including the `:on_recovered`
+handler.
 
 A *database* error is different: it raises, and (by default) the surrounding transaction rolls
 back every change from the call. To recover invalid rows instead of skipping them, see the

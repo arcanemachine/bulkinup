@@ -78,15 +78,11 @@ Two small things to watch while moving the wrapper's defaults:
 - If the wrapper was the last user of an alias (or import), remove it too, or
   `mix compile --warnings-as-errors` will fail on the unused alias.
 
-## Log metadata
+## Logging
 
-If you filter logs on the library's `:reason` metadata, two atoms were renamed with the
-function:
-
-- `:bulk_upsert_changeset_error` is now `:upsert_changeset_error`
-- `:bulk_upsert_items_skipped` is now `:upsert_items_skipped`
-
-(`insert/4` uses `:insert_changeset_error` and `:insert_items_skipped`.)
+Since 0.8.0, Bulkinup does not log, so the skipped-items `:warning` and the `:debug` details
+(and their `:reason` metadata) are gone. To keep logging skipped items, pass an `:on_skipped`
+handler (see the Handlers section of `Bulkinup.upsert/4`).
 
 ## What's new since 0.5.x
 

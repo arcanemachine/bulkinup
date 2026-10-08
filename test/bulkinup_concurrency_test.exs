@@ -33,17 +33,22 @@ defmodule BulkinupConcurrencyTest do
     assert Repo.aggregate(Author, :count) == 5
   end
 
-  test "logs one warning summarizing skipped rows across concurrent chunks" do
+  test "calls on_skipped from each concurrent chunk that has skipped rows" do
+    test_pid = self()
     attrs_list = [%{id: 1, name: "a"}, %{id: 2}, %{id: 3, name: "c"}, %{id: 4}]
 
-    {result, log} =
-      ExUnit.CaptureLog.with_log([level: :warning], fn ->
-        Bulkinup.upsert(Repo, Author, attrs_list, chunk_size: 1, max_concurrency: 2)
-      end)
+    {:ok, %{upserted: 2, skipped: 2}} =
+      Bulkinup.upsert(Repo, Author, attrs_list,
+        chunk_size: 1,
+        max_concurrency: 2,
+        on_skipped: &send(test_pid, {:skipped, &1})
+      )
 
-    assert {:ok, %{upserted: 2, skipped: 2}} = result
-    assert log =~ "Skipped 2 of 4 items"
-    assert length(String.split(log, "Skipped")) == 2
+    assert_received {:skipped, %{changesets: [first_changeset]}}
+    assert_received {:skipped, %{changesets: [second_changeset]}}
+    refute_received {:skipped, _}
+
+    assert Enum.sort([first_changeset.changes.id, second_changeset.changes.id]) == [2, 4]
   end
 
   @tag :capture_log

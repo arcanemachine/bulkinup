@@ -86,17 +86,17 @@ defmodule BulkinupInsertTest do
     end
   end
 
-  test "returns inserted and skipped counts, and summarizes skipped rows in one warning" do
+  test "returns inserted and skipped counts, and reports skipped rows to on_skipped" do
+    test_pid = self()
     attrs_list = [%{id: 1, name: "Alice"}, %{id: 2}]
 
-    {result, log} =
-      ExUnit.CaptureLog.with_log([level: :warning], fn ->
-        Bulkinup.insert(Repo, Author, attrs_list)
-      end)
+    assert {:ok, %{inserted: 1, skipped: 1}} =
+             Bulkinup.insert(Repo, Author, attrs_list,
+               on_skipped: &send(test_pid, {:skipped, &1})
+             )
 
-    assert {:ok, %{inserted: 1, skipped: 1}} = result
-    assert log =~ "Skipped 1 of 2 items"
-    assert log =~ "were not inserted"
+    assert_received {:skipped, %{verb: :insert, schema_module: Author, changesets: [changeset]}}
+    assert changeset.changes.id == 2
   end
 
   test "composes with a Stream as attrs input" do

@@ -342,20 +342,55 @@ defmodule BulkinupTest do
              Enum.map(1..5, &"author-#{&1}")
   end
 
-  test "logs one warning summarizing skipped rows across all chunks of a stream" do
-    # With chunk_size: 1, the two invalid rows land in different chunks
+  test "calls on_skipped once per chunk with the chunk's skipped changesets" do
+    test_pid = self()
+
+    # With chunk_size: 2, the first chunk holds one invalid row and the second chunk holds another
     attrs_stream = Stream.map([%{id: 1}, %{id: 2, name: "valid"}, %{id: 3}], & &1)
 
-    {result, log} =
-      ExUnit.CaptureLog.with_log([level: :warning], fn ->
-        Bulkinup.upsert(Repo, Author, attrs_stream, chunk_size: 1)
-      end)
+    {:ok, %{upserted: 1, skipped: 2}} =
+      Bulkinup.upsert(Repo, Author, attrs_stream,
+        chunk_size: 2,
+        on_skipped: &send(test_pid, {:skipped, &1})
+      )
 
-    assert {:ok, %{upserted: 1, skipped: 2}} = result
+    assert_received {:skipped, %{verb: :upsert, schema_module: Author, changesets: [changeset]}}
+    assert changeset.changes.id == 1
+    assert Keyword.has_key?(changeset.errors, :name)
 
-    # One summary covers both skipped rows, emitted once for the whole call rather than per chunk
-    assert log =~ "Skipped 2 of 3 items"
-    assert length(String.split(log, "Skipped")) == 2
+    assert_received {:skipped, %{changesets: [changeset]}}
+    assert changeset.changes.id == 3
+
+    refute_received {:skipped, _}
+  end
+
+  test "does not call on_skipped when no rows are skipped" do
+    test_pid = self()
+
+    {:ok, %{upserted: 1, skipped: 0}} =
+      Bulkinup.upsert(Repo, Author, [%{id: 1, name: "valid"}],
+        on_skipped: &send(test_pid, {:skipped, &1})
+      )
+
+    refute_received {:skipped, _}
+  end
+
+  test "raises when a handler is not a 1-arity function" do
+    for handler_option <- [:on_skipped, :on_recovered] do
+      assert_raise ArgumentError, ~r/must be a 1-arity function/, fn ->
+        Bulkinup.upsert(Repo, Author, [%{id: 1, name: "Alice"}], [{handler_option, fn -> :ok end}])
+      end
+    end
+  end
+
+  test "rolls back the write when a handler raises" do
+    attrs_list = [%{id: 1, name: "valid"}, %{id: 2}]
+
+    assert_raise RuntimeError, "handler failed", fn ->
+      Bulkinup.upsert(Repo, Author, attrs_list, on_skipped: fn _ -> raise "handler failed" end)
+    end
+
+    assert Repo.aggregate(Author, :count) == 0
   end
 
   test "raises when chunk_size is not a positive integer" do
@@ -401,20 +436,45 @@ defmodule BulkinupTest do
     assert Repo.get!(Author, 1).name == "Alice"
   end
 
-  test "logs one warning summarizing all skipped rows" do
-    attrs_list = [%{id: 1}, %{id: 2}, %{id: 3, name: "valid"}]
+  test "calls on_recovered with the pre-recovery changesets of written rows, at every level" do
+    test_pid = self()
 
-    {result, log} =
-      ExUnit.CaptureLog.with_log([level: :warning], fn ->
-        Bulkinup.upsert(Repo, Author, attrs_list)
-      end)
+    attrs_list = [
+      # The author's phone number and the post's missing title are both recovered
+      %{
+        id: 1,
+        name: "Alice",
+        phone_number: "INVALID",
+        posts: [%{id: 101, author_id: 1}]
+      },
+      # The post's missing title is recoverable, but the author's missing name is not, so this
+      # row is skipped and its recovered post is not reported
+      %{id: 2, posts: [%{id: 201, author_id: 2}]}
+    ]
 
-    assert {:ok, %{upserted: 1, skipped: 2}} = result
+    {:ok, %{upserted: 1, skipped: 1}} =
+      Bulkinup.upsert(Repo, Author, attrs_list,
+        recover_changeset_errors: %{
+          Author => %{phone_number: "555-1234"},
+          Post => %{title: "UNTITLED"}
+        },
+        on_recovered: &send(test_pid, {:recovered, &1})
+      )
 
-    # One summary warning covers both skipped rows; the per-row details are logged at `:debug`
-    # and do not appear at the `:warning` level
-    assert log =~ "Skipped 2 of 3 items"
-    refute log =~ "This changeset has one or more unrecoverable errors"
+    assert_received {:recovered,
+                     %{verb: :upsert, schema_module: Author, changesets: recovered_changesets}}
+
+    refute_received {:recovered, _}
+
+    # Each changeset is reported as it was before recovery, with its replaced fields' errors
+    recovered_by_schema = Map.new(recovered_changesets, &{&1.data.__struct__, &1})
+    assert Map.keys(recovered_by_schema) |> Enum.sort() == Enum.sort([Author, Post])
+    assert Keyword.keys(recovered_by_schema[Author].errors) == [:phone_number]
+    assert recovered_by_schema[Author].changes.phone_number == "INVALID"
+    assert Keyword.keys(recovered_by_schema[Post].errors) == [:title]
+    assert recovered_by_schema[Post].changes.id == 101
+
+    assert Repo.get!(Author, 1).phone_number == "555-1234"
   end
 
   @tag :capture_log

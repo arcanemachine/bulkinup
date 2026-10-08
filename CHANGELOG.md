@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions <= 0.5.x were released as
 [`bulk_upsert`](https://hex.pm/packages/bulk_upsert).
 
+## Unreleased
+
+### Changed
+
+- **Breaking:** Bulkinup no longer logs. The per-call `:warning` summary of skipped items, the
+  per-item `:debug` details, and the `:debug` log for each recovered field are removed, along
+  with their `:reason` log metadata. To keep logging skipped items, pass an `:on_skipped`
+  handler that logs (see the Handlers section of `Bulkinup.upsert/4`)
+
+### Added
+
+- Options `:on_skipped` and `:on_recovered` take 1-arity handler functions, called once per
+  chunk: `:on_skipped` receives the changesets of the skipped items, and `:on_recovered`
+  receives the changesets whose errors were replaced by `:recover_changeset_errors` fallbacks
+  (as they were before recovery)
+
 ## v0.7.0 - 2026-07-05
 
 ### Changed

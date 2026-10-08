@@ -20,12 +20,7 @@ defmodule Bulkinup do
   [Migrating from bulk_upsert](migrating_from_bulk_upsert.html).
   """
 
-  require Logger
-
   @default_timeout 15_000
-
-  # Cap the number of skipped-item IDs included in the summary warning's metadata
-  @skipped_item_ids_log_limit 50
 
   @valid_options [
     :changeset_function,
@@ -34,6 +29,8 @@ defmodule Bulkinup do
     :insert_all_module,
     :insert_all_opts,
     :max_concurrency,
+    :on_recovered,
+    :on_skipped,
     :placeholders,
     :recover_changeset_errors,
     :replace_all_except,
@@ -64,6 +61,8 @@ defmodule Bulkinup do
           insert_all_module: module(),
           insert_all_opts: %{optional(module() | Ecto.Schema.source()) => Keyword.t()},
           max_concurrency: pos_integer(),
+          on_recovered: (handler_input() -> any()),
+          on_skipped: (handler_input() -> any()),
           placeholders: %{
             optional(module() | Ecto.Schema.source()) => %{optional(atom()) => term()}
           },
@@ -71,6 +70,16 @@ defmodule Bulkinup do
           replace_all_except: [atom()],
           timeout: timeout()
         ]
+
+  @typedoc """
+  The map passed to the `:on_skipped` and `:on_recovered` handlers, once per chunk. See
+  `upsert/4`'s documentation for details.
+  """
+  @type handler_input :: %{
+          verb: :insert | :upsert,
+          schema_module: module(),
+          changesets: [Ecto.Changeset.t()]
+        }
 
   @doc """
   Validate attrs maps (`attrs_list`) by passing them through an Ecto changeset, then upsert the
@@ -106,16 +115,17 @@ defmodule Bulkinup do
 
   Returns `{:ok, %{upserted: upserted_count, skipped: skipped_count}}`, where the counts refer to
   the top-level attrs: `:upserted` is the number of items sent to the database, and `:skipped` is
-  the number of items dropped because their changesets were invalid. (Skipped items are
-  summarized in one `:warning` log per call, with per-item detail at the `:debug` level.) A
-  database error raises; by default the entire upsert runs in a single transaction, so every
-  change is rolled back (with `:max_concurrency`, only the failing chunk is — see below).
+  the number of items dropped because their changesets were invalid. Bulkinup does not log; to
+  inspect, log, or report the skipped items, pass an `:on_skipped` handler (see the Handlers
+  section below). A database error raises; by default the entire upsert runs in a single
+  transaction, so every change is rolled back (with `:max_concurrency`, only the failing chunk
+  is — see below).
 
   ## Streaming
 
   `attrs_list` is consumed lazily, in chunks of `:chunk_size` items: a `Stream` is never fully
   materialized, so memory stays bounded for arbitrarily large inputs. Plain lists behave
-  identically (same counts, same single skipped-items summary log). Note that without
+  identically (same counts, same handler calls). Note that without
   `:max_concurrency`, the single transaction — and any locks it takes — stays open for the
   stream's full duration.
 
@@ -148,6 +158,12 @@ defmodule Bulkinup do
   Inherited from the value specified in the `repo_module` function argument, e.g.
   `YourProject.Repo`)
     - Example: `YourProject.OtherRepo`
+
+  - `:on_recovered` - A 1-arity function called with the changesets whose errors were replaced by
+  `:recover_changeset_errors` fallbacks. See the Handlers section below. (Default: `nil`)
+
+  - `:on_skipped` - A 1-arity function called with the changesets of the items that were skipped
+  because of unrecoverable errors. See the Handlers section below. (Default: `nil`)
 
   - `:insert_all_opts` - Pass custom `opts` to the `insert_all/3` function. This option consists
   of a map whose key is the schema or source that may have items being upserted, and the value is
@@ -207,6 +223,47 @@ defmodule Bulkinup do
   chunks), also applied to each `insert_all/3` query. With `:max_concurrency`, the timeout
   applies to each chunk's transaction instead. (Default: `#{@default_timeout}`)
     - Example: `60_000`
+
+  ## Handlers
+
+  Bulkinup does not log. Instead, the `:on_skipped` and `:on_recovered` handlers receive the
+  affected changesets, so the caller decides what to do with them (log them at a chosen level,
+  report them to an error tracker, collect them, etc.). Each handler is called once per chunk
+  that has affected items, with a `t:handler_input/0` map:
+
+      %{verb: :upsert, schema_module: YourProject.Persons.Person, changesets: changesets}
+
+  - `:on_skipped` receives the top-level changesets of the skipped items. Each changeset's
+  `errors` (and its nested changesets' errors) explain why the item was skipped.
+  - `:on_recovered` receives each changeset (top-level or nested) whose errors were replaced by
+  fallback values, as it was before the fallbacks were applied. Each changeset's `errors` list
+  the fields that were replaced, and why. Only changesets of items that were written are
+  included: a recovered changeset inside a skipped item is not reported.
+
+  A handler runs inside the chunk's transaction, after the chunk's valid items are written:
+
+  - A slow handler holds the transaction (and its locks) open.
+  - A handler that raises rolls back the transaction, and the exception propagates to the caller.
+  - Without `:max_concurrency`, a later chunk that fails rolls back the items of chunks that were
+  already reported to a handler.
+  - With `:max_concurrency`, a handler runs in a task process, so it does not inherit the
+  caller's process dictionary or `Logger` metadata.
+
+  For example, to log a summary of each chunk's skipped items:
+
+      require Logger
+
+      Bulkinup.upsert(YourProject.Repo, YourProject.Persons.Person, attrs_list,
+        on_skipped: fn %{schema_module: schema_module, changesets: changesets} ->
+          Logger.warning(
+            "Skipped \#{length(changesets)} \#{inspect(schema_module)} items with invalid " <>
+              "changesets: \#{inspect(Enum.map(changesets, & &1.errors))}"
+          )
+        end
+      )
+
+  To apply a handler to every call, set it in the `use Bulkinup` defaults (see `__using__/1`),
+  e.g. `use Bulkinup, on_skipped: &YourProject.BulkinupHandlers.log_skipped/1`.
 
   ## Examples
 
@@ -298,9 +355,9 @@ defmodule Bulkinup do
   as `upsert/4`'s counts.
 
   Everything else — changeset validation, `:recover_changeset_errors`, `:placeholders`,
-  chunking, streaming input, `:max_concurrency`, `:timeout`, and the skipped-items summary
-  logging — behaves exactly as documented for `upsert/4`. The upsert-only option
-  `:replace_all_except` raises an `ArgumentError`.
+  chunking, streaming input, `:max_concurrency`, `:timeout`, and the `:on_skipped` and
+  `:on_recovered` handlers — behaves exactly as documented for `upsert/4`. The upsert-only
+  option `:replace_all_except` raises an `ArgumentError`.
   """
   @spec insert(module(), module(), Enumerable.t(map()), options()) ::
           {:ok, %{inserted: non_neg_integer(), skipped: non_neg_integer()}}
@@ -429,6 +486,8 @@ defmodule Bulkinup do
       changeset_function: Keyword.get(opts, :changeset_function, :changeset),
       chunk_size: Keyword.get(opts, :chunk_size, 1000),
       max_concurrency: Keyword.get(opts, :max_concurrency),
+      on_recovered: Keyword.get(opts, :on_recovered),
+      on_skipped: Keyword.get(opts, :on_skipped),
       recover_changeset_errors: Keyword.get(opts, :recover_changeset_errors, %{}),
       insert_all_module: Keyword.get(opts, :insert_all_module, repo_module),
       insert_all_function: Keyword.get(opts, :insert_all_function, :insert_all),
@@ -461,9 +520,12 @@ defmodule Bulkinup do
     totals =
       changeset_chunks
       |> write_chunks(repo_module, schema_module, config)
-      |> aggregate_chunk_results()
-
-    if totals.skipped > 0, do: log_skipped_changesets_summary(schema_module, totals, verb)
+      |> Enum.reduce(%{written: 0, skipped: 0}, fn chunk_result, totals ->
+        %{
+          written: totals.written + chunk_result.written,
+          skipped: totals.skipped + chunk_result.skipped
+        }
+      end)
 
     {:ok, %{count_key(verb) => totals.written, skipped: totals.skipped}}
   end
@@ -471,10 +533,6 @@ defmodule Bulkinup do
   # The key the verb's written count is returned under
   defp count_key(:insert), do: :inserted
   defp count_key(:upsert), do: :upserted
-
-  # The verb as it appears in log prose
-  defp verb_past_tense(:insert), do: "inserted"
-  defp verb_past_tense(:upsert), do: "upserted"
 
   # Write every chunk sequentially, wrapped in a single transaction so that any failure rolls
   # back all changes made to every chunk of parents and all of their associations
@@ -523,50 +581,32 @@ defmodule Bulkinup do
     end)
   end
 
-  # Validate, recover, and write one chunk of parent changesets, returning the chunk's counts
-  # and the primary keys of its skipped items (capped, for the end-of-call summary log)
+  # Validate, recover, and write one chunk of parent changesets, report the chunk's recovered and
+  # skipped changesets to their handlers, and return the chunk's counts
   defp write_chunk(schema_module, changesets, config) do
-    {valid_changesets, invalid_changesets} =
+    {valid_results, invalid_results} =
       changesets
-      |> recover_changesets_with_recoverable_errors(config.recover_changeset_errors)
-      |> Enum.split_with(& &1.valid?)
+      |> Enum.map(&recover_changeset(&1, config.recover_changeset_errors))
+      |> Enum.split_with(fn {changeset, _recovered_changesets} -> changeset.valid? end)
 
-    Enum.each(invalid_changesets, &log_on_changeset_error(schema_module, &1, config.verb))
+    valid_changesets = Enum.map(valid_results, &elem(&1, 0))
+    invalid_changesets = Enum.map(invalid_results, &elem(&1, 0))
 
     if valid_changesets != [], do: do_bulk_write(schema_module, valid_changesets, config)
 
-    %{
-      written: length(valid_changesets),
-      skipped: length(invalid_changesets),
-      skipped_item_ids:
-        invalid_changesets
-        |> Enum.take(@skipped_item_ids_log_limit)
-        |> Enum.map(&changeset_primary_key(schema_module, &1))
-    }
+    # Recoveries inside a skipped item are not reported, since the item was not written
+    recovered_changesets = Enum.flat_map(valid_results, &elem(&1, 1))
+
+    call_handler(config.on_recovered, recovered_changesets, schema_module, config.verb)
+    call_handler(config.on_skipped, invalid_changesets, schema_module, config.verb)
+
+    %{written: length(valid_changesets), skipped: length(invalid_changesets)}
   end
 
-  # Sum the per-chunk counts, keeping the skipped-item IDs capped so an arbitrarily long input
-  # cannot accumulate unbounded log metadata
-  defp aggregate_chunk_results(chunk_results) do
-    initial_totals = %{written: 0, skipped: 0, skipped_item_ids: []}
-
-    Enum.reduce(chunk_results, initial_totals, fn chunk_result, totals ->
-      remaining_id_slots = @skipped_item_ids_log_limit - length(totals.skipped_item_ids)
-
-      %{
-        written: totals.written + chunk_result.written,
-        skipped: totals.skipped + chunk_result.skipped,
-        skipped_item_ids:
-          totals.skipped_item_ids ++ Enum.take(chunk_result.skipped_item_ids, remaining_id_slots)
-      }
-    end)
-  end
-
-  defp changeset_primary_key(schema_module, changeset) do
-    schema_module.__schema__(:primary_key)
-    |> Map.new(fn primary_key_field ->
-      {primary_key_field, changeset.changes[primary_key_field]}
-    end)
+  defp call_handler(handler, changesets, schema_module, verb) do
+    if handler != nil and changesets != [] do
+      handler.(%{verb: verb, schema_module: schema_module, changesets: changesets})
+    end
   end
 
   # Raise on unknown option names, on upsert-only options given to `insert/4`, and on
@@ -611,6 +651,17 @@ defmodule Bulkinup do
       the `:max_concurrency` option must be a positive integer, got: #{inspect(max_concurrency)}\
       """
     end
+
+    Enum.each([:on_recovered, :on_skipped], fn handler_option ->
+      handler = Keyword.get(opts, handler_option)
+
+      if not (is_nil(handler) or is_function(handler, 1)) do
+        raise ArgumentError, """
+        the `#{inspect(handler_option)}` option must be a 1-arity function, \
+        got: #{inspect(handler)}\
+        """
+      end
+    end)
 
     insert_all_opts = Keyword.get(opts, :insert_all_opts, %{})
 
@@ -889,80 +940,21 @@ defmodule Bulkinup do
     |> Keyword.keys()
   end
 
-  defp log_on_changeset_error(schema_module, changeset, verb) do
-    item_id_or_ids = changeset_primary_key(schema_module, changeset)
-
-    invalid_parent_attrs =
-      changeset.errors
-      |> Enum.reduce(%{}, fn {k, _v}, acc -> Map.put(acc, k, changeset.changes[k]) end)
-      # If a parent has an error in an association, the error will appear as a changeset, which
-      # clutters up the logs. So, remove association errors from the invalid attrs map. The error
-      # message for the field will still appear in the logs, so the information about the error
-      # will still get passed along
-      |> Map.new(fn {k, v} ->
-        if k in schema_module.__schema__(:associations),
-          do: {k, :changesets_hidden_to_keep_logs_shorter},
-          else: {k, v}
-      end)
-
-    invalid_association_attrs =
-      schema_module
-      |> get_schema_associations(:has)
-      # Only check associations that are present in the changeset's changes (i.e. they aren't nil)
-      |> Enum.reject(&is_nil(changeset.changes[&1]))
-      |> Enum.reduce(%{}, fn association, acc ->
-        association_error_items =
-          changeset.changes[association]
-          # `has_one` changes are a single changeset; `has_many` changes are a list of changesets.
-          |> List.wrap()
-          |> Enum.reject(fn changeset -> Enum.empty?(changeset.errors) end)
-          |> Enum.reduce([], fn changeset, acc ->
-            changeset_error_items =
-              changeset.errors
-              |> Keyword.keys()
-              |> Enum.reduce([], fn key, acc ->
-                acc |> Keyword.put(key, changeset.changes[key])
-              end)
-
-            changeset_error_items ++ acc
-          end)
-
-        if Enum.empty?(association_error_items),
-          do: acc,
-          else: acc |> Map.put(association, association_error_items)
-      end)
-
-    invalid_attrs = Map.merge(invalid_parent_attrs, invalid_association_attrs)
-
-    Logger.debug(
-      """
-      This changeset has one or more unrecoverable errors. The item associated with this \
-      changeset will not be #{verb_past_tense(verb)}.\
-      """,
-      reason: changeset_error_reason(verb),
-      schema_module: inspect(schema_module),
-      item_id_or_ids: item_id_or_ids,
-      # NOTE: If one item in an array contains an invalid value, the whole array will be logged
-      fields_with_invalid_attrs: Map.keys(invalid_attrs),
-      changeset_errors: changeset.errors
-    )
-  end
-
-  defp recover_changesets_with_recoverable_errors(changesets, recover_changeset_errors)
-       when changesets == [] or recover_changeset_errors == %{} do
-    changesets
-  end
-
-  defp recover_changesets_with_recoverable_errors(changesets, recover_changeset_errors) do
-    Enum.map(changesets, &recover_changeset(&1, recover_changeset_errors))
-  end
-
   # Recover a single changeset, recursing into its nested association changesets first
   # (bottom-up). An association's error on the parent is cleared once all of that association's
   # child changesets are valid. The changeset itself is then recovered only if every remaining
   # error field has a fallback configured for the changeset's schema.
+  #
+  # Returns `{changeset, recovered_changesets}`, where `recovered_changesets` holds every
+  # changeset (this one or a nested one) whose field errors were replaced by fallbacks, as it
+  # was before the fallbacks were applied.
   defp recover_changeset(%Ecto.Changeset{valid?: true} = changeset, _recover_changeset_errors) do
-    changeset
+    {changeset, []}
+  end
+
+  defp recover_changeset(changeset, recover_changeset_errors)
+       when recover_changeset_errors == %{} do
+    {changeset, []}
   end
 
   defp recover_changeset(changeset, recover_changeset_errors) do
@@ -970,10 +962,13 @@ defmodule Bulkinup do
 
     # Recover the nested association and embed changesets before the changeset's own errors,
     # since a nested error can only be cleared once all of its child changesets are valid
-    changeset =
+    {changeset, nested_recovered_changesets} =
       (schema_module.__schema__(:associations) ++ schema_module.__schema__(:embeds))
-      |> Enum.reduce(changeset, fn association, acc_changeset ->
-        recover_nested_changesets(acc_changeset, association, recover_changeset_errors)
+      |> Enum.reduce({changeset, []}, fn association, {acc_changeset, acc_recovered} ->
+        {acc_changeset, recovered} =
+          recover_nested_changesets(acc_changeset, association, recover_changeset_errors)
+
+        {acc_changeset, acc_recovered ++ recovered}
       end)
 
     fallbacks = Map.get(recover_changeset_errors, schema_module, %{})
@@ -990,22 +985,27 @@ defmodule Bulkinup do
       # only set `valid?: false`), so the children's own validity is checked directly. A
       # changeset with an unrecovered child cannot be recovered
       not nested_changesets_valid?(changeset, schema_module) ->
-        changeset
+        {changeset, nested_recovered_changesets}
 
       error_fields == [] ->
         # Every error was an association error, and all child changesets have been recovered
-        %{changeset | valid?: true}
+        {%{changeset | valid?: true}, nested_recovered_changesets}
 
       Enum.all?(error_fields, recoverable_field?) ->
-        error_fields
-        |> Enum.reduce(changeset, &recover_changeset_field(&2, &1, Map.fetch!(fallbacks, &1)))
-        # Clear the changeset's errors and mark the changeset as valid
-        |> Map.merge(%{errors: [], valid?: true})
+        recovered_changeset =
+          error_fields
+          |> Enum.reduce(changeset, fn field, acc_changeset ->
+            put_in(acc_changeset.changes[field], Map.fetch!(fallbacks, field))
+          end)
+          # Clear the changeset's errors and mark the changeset as valid
+          |> Map.merge(%{errors: [], valid?: true})
+
+        {recovered_changeset, nested_recovered_changesets ++ [changeset]}
 
       true ->
         # The changeset has errors with no configured fallback. The changeset (or its parent, for
         # a nested changeset) will be removed later in the pipeline
-        changeset
+        {changeset, nested_recovered_changesets}
     end
   end
 
@@ -1026,19 +1026,23 @@ defmodule Bulkinup do
   end
 
   # Recover the changesets in one association's (or embed's) changes, clearing the association's
-  # error on the parent once every child changeset is valid.
+  # error on the parent once every child changeset is valid. Returns
+  # `{changeset, recovered_changesets}`, as `recover_changeset/2` does.
   defp recover_nested_changesets(changeset, association, recover_changeset_errors) do
     case changeset.changes[association] do
       nil ->
-        changeset
+        {changeset, []}
 
       children ->
         # `has_many`, `many_to_many`, and `embeds_many` changes are a list of changesets;
         # `has_one` and `embeds_one` changes are a single changeset. `List.wrap/1` normalizes
         # both into a list for recovery, and the original shape is restored when the changes are
         # updated
-        recovered =
-          children |> List.wrap() |> Enum.map(&recover_changeset(&1, recover_changeset_errors))
+        {recovered, recovered_changesets} =
+          children
+          |> List.wrap()
+          |> Enum.map(&recover_changeset(&1, recover_changeset_errors))
+          |> Enum.unzip()
 
         recovered_children = if is_list(children), do: recovered, else: hd(recovered)
 
@@ -1047,56 +1051,12 @@ defmodule Bulkinup do
           | changes: Map.put(changeset.changes, association, recovered_children)
         }
 
-        if Enum.all?(recovered, & &1.valid?),
-          do: Map.update!(changeset, :errors, &Keyword.delete(&1, association)),
-          else: changeset
+        changeset =
+          if Enum.all?(recovered, & &1.valid?),
+            do: Map.update!(changeset, :errors, &Keyword.delete(&1, association)),
+            else: changeset
+
+        {changeset, Enum.concat(recovered_changesets)}
     end
   end
-
-  defp recover_changeset_field(changeset, field, recover_to_value) do
-    primary_key_info =
-      changeset.data.__struct__.__schema__(:primary_key)
-      |> Keyword.new(fn primary_key_field ->
-        # The primary key may be absent from the changes (e.g. if the changeset function does
-        # not require it), so avoid `Map.fetch!/2`
-        {primary_key_field, Map.get(changeset.changes, primary_key_field)}
-      end)
-
-    Logger.debug("""
-    Recovered changeset error for struct #{Macro.to_string(changeset.data.__struct__)} with \
-    primary key(s) `#{inspect(primary_key_info)}` in the field `#{field}`.\
-    """)
-
-    %{changeset | changes: Map.put(changeset.changes, field, recover_to_value)}
-  end
-
-  # One `:warning` per call summarizes every skipped item, accumulated across all chunks. The
-  # per-item details are logged at the `:debug` level, so a large batch of invalid rows cannot
-  # flood the log.
-  defp log_skipped_changesets_summary(schema_module, totals, verb) do
-    truncation_note =
-      if totals.skipped > @skipped_item_ids_log_limit,
-        do: " The first #{@skipped_item_ids_log_limit} skipped item IDs are listed.",
-        else: ""
-
-    Logger.warning(
-      """
-      Skipped #{totals.skipped} of #{totals.written + totals.skipped} items because their \
-      changesets had unrecoverable errors. The skipped items were not \
-      #{verb_past_tense(verb)}. Details for each skipped item are logged at the `:debug` \
-      level.#{truncation_note}\
-      """,
-      reason: items_skipped_reason(verb),
-      schema_module: inspect(schema_module),
-      skipped_count: totals.skipped,
-      item_ids: totals.skipped_item_ids
-    )
-  end
-
-  # Log metadata `:reason` atoms, per verb
-  defp changeset_error_reason(:insert), do: :insert_changeset_error
-  defp changeset_error_reason(:upsert), do: :upsert_changeset_error
-
-  defp items_skipped_reason(:insert), do: :insert_items_skipped
-  defp items_skipped_reason(:upsert), do: :upsert_items_skipped
 end
