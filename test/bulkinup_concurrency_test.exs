@@ -51,7 +51,6 @@ defmodule BulkinupConcurrencyTest do
     assert Enum.sort([first_changeset.changes.id, second_changeset.changes.id]) == [2, 4]
   end
 
-  @tag :capture_log
   test "keeps committed chunks when a later chunk fails" do
     # With max_concurrency: 1 the chunks run in order, one transaction each: Alice's chunk
     # commits before Bob's post fails its foreign key constraint

@@ -293,7 +293,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Author, 1).name == "Anonymous"
   end
 
-  @tag :capture_log
   test "skips a row whose association attrs cannot be cast when placeholders are configured" do
     # The uncastable posts value is left untouched by placeholder injection, so the changeset
     # reports the cast error and the row is skipped in the usual way
@@ -315,7 +314,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Author, 10).name == nil
   end
 
-  @tag :capture_log
   test "rejects invalid changesets and reports them as skipped" do
     attrs_list = [
       %{id: 1, name: "valid"},
@@ -477,7 +475,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Author, 1).phone_number == "555-1234"
   end
 
-  @tag :capture_log
   test "recovers configured changeset errors before upsert" do
     attrs_list = [%{id: 1, name: "Alice", phone_number: "INVALID"}]
 
@@ -489,7 +486,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Author, 1).phone_number == "555-1234"
   end
 
-  @tag :capture_log
   test "recovers changeset errors in nested association changesets" do
     # The post is missing its required title, so the author's changeset carries a `:posts` error
     attrs_list = [
@@ -504,7 +500,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Post, 101).title == "UNTITLED"
   end
 
-  @tag :capture_log
   test "recovers changeset errors across multiple nesting levels" do
     # The comment is missing its required body, which invalidates the post and the author in
     # turn. Recovering the comment cascades validity back up through both ancestors
@@ -531,7 +526,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Comment, 1001).body == "[deleted]"
   end
 
-  @tag :capture_log
   test "recovers changeset errors in a has_one association changeset" do
     # The profile is missing its required bio
     attrs_list = [%{id: 1, name: "Alice", profile: %{id: 101, author_id: 1}}]
@@ -544,7 +538,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Profile, 101).bio == "(none)"
   end
 
-  @tag :capture_log
   test "recovers changeset errors in a many_to_many association changeset" do
     Repo.insert!(%Author{id: 1, name: "Alice"})
 
@@ -560,7 +553,6 @@ defmodule BulkinupTest do
     assert Repo.aggregate("posts_tags", :count) == 1
   end
 
-  @tag :capture_log
   test "recovers one invalid child among valid siblings" do
     attrs_list = [
       %{
@@ -582,7 +574,6 @@ defmodule BulkinupTest do
              [{101, "a"}, {102, "UNTITLED"}]
   end
 
-  @tag :capture_log
   test "counts recovered and unrecoverable rows independently" do
     # Post 101 is missing only its title (recoverable); post 201 is also missing its author_id,
     # which has no fallback, so Bob's row is skipped
@@ -600,7 +591,6 @@ defmodule BulkinupTest do
     assert Repo.all(from p in Post, select: p.id) == [101]
   end
 
-  @tag :capture_log
   test "does not upsert a recoverable parent whose child is unrecoverable" do
     # The author's phone_number is recoverable, but the post's missing author_id is not. The
     # whole row is skipped: the parent's recoverable error must not be applied partially
@@ -620,7 +610,6 @@ defmodule BulkinupTest do
     assert Repo.aggregate(Post, :count) == 0
   end
 
-  @tag :capture_log
   test "recovers changeset errors in an embeds_one changeset" do
     # The address is missing its required city
     attrs_list = [%{id: 1, name: "Alice", address: %{street: "1 Main St"}}]
@@ -633,7 +622,6 @@ defmodule BulkinupTest do
     assert Repo.get!(Author, 1).address == %Address{street: "1 Main St", city: "Springfield"}
   end
 
-  @tag :capture_log
   test "recovers changeset errors in an embeds_many changeset" do
     # The second social link is missing its required url
     attrs_list = [
@@ -658,7 +646,6 @@ defmodule BulkinupTest do
            ]
   end
 
-  @tag :capture_log
   test "skips the row when an embedded changeset error has no fallback" do
     # The address is missing its required city, and only :street has a fallback configured
     attrs_list = [%{id: 1, name: "Alice", address: %{street: "1 Main St"}}]
@@ -671,7 +658,6 @@ defmodule BulkinupTest do
     assert Repo.aggregate(Author, :count) == 0
   end
 
-  @tag :capture_log
   test "does not recover an error on the association field itself" do
     # The posts attr cannot be cast at all, leaving a `:posts` error on the author. A fallback
     # configured for the association field is ignored (a bare value cannot replace changesets)
@@ -685,7 +671,6 @@ defmodule BulkinupTest do
     assert Repo.aggregate(Author, :count) == 0
   end
 
-  @tag :capture_log
   test "skips the row when a nested changeset error has no fallback" do
     # The post is missing its required author_id, and only :title has a fallback configured
     attrs_list = [
