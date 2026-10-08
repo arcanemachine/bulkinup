@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versions <= 0.5.x were released as
 [`bulk_upsert`](https://hex.pm/packages/bulk_upsert).
 
-## Unreleased
+## v0.8.0 - 2026-10-08
 
 ### Changed
 

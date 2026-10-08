@@ -28,7 +28,7 @@ Add this package to your list of dependencies in `mix.exs`, then run `mix deps.g
 ```elixir
 def deps do
   [
-    {:bulkinup, "~> 0.7.0"}
+    {:bulkinup, "~> 0.8.0"}
   ]
 end
 ```

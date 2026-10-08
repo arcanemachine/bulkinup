@@ -14,7 +14,7 @@ In `mix.exs`:
 {:bulk_upsert, "~> 0.5.0"}
 
 # After
-{:bulkinup, "~> 0.7.0"}
+{:bulkinup, "~> 0.8.0"}
 ```
 
 Then `mix deps.get`. (All `bulk_upsert` versions are retired on Hex — they still resolve and
